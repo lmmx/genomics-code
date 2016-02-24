@@ -15,17 +15,29 @@ seqlevels(ref.peaks) <- paste0('chr', seqlevels(ref.peaks))
 if (!exists txdb_hg19) {
   txdb_hg19 <- TxDb.Hsapiens.UCSC.hg19.knownGene
   genes <- as.data.frame(transcripts(txdb_hg19))
-  colnames(genes)[1:3]=c("chrom","txStart","txEnd")
-  tss = genes$txStart
-  idx = genes$strand == '-'
-  tss[idx] = genes$txEnd[idx]
-  tes = genes$txEnd
-  tes[idx] = genes$txStart[idx]
+  colnames(genes)[1:3] <- c("chrom","txStart","txEnd")
+  tss <- genes$txStart
+  n.str <- genes$strand == '-'
+  tss[n.str] <- genes$txEnd[n.str]
+  tss.kb.us <- tss - 1000
+  tss.kb.us[n.str] <- tss[n.str] + 1000
+  tes <- genes$txEnd
+  tes[n.str] <- genes$txStart[n.str]
   genes$txStart <- tss
+  genes$txKbUs <- tss.kb.us
   genes$txEnd <- tes
   
+  us.asc.coords <- transform(genes[c("txStart","txKbUs")],
+                             min = ifelse(n.str, txStart, txKbUs),
+                             max = ifelse(n.str, txKbUs, txStart))
+  min.coords <- us.asc.coords$min
+  max.coords <- us.asc.coords$max
+  
   # Create a GRanges object for upstream of the TSSs
-  tss.us <- GRanges(seqnames=Rle(genes$chrom), ranges=IRanges(tss-1000, tss))
+  tss.us <- GRanges(seqnames = Rle(genes$chrom),
+                    strand = Rle(genes$strand),
+                    ranges = IRanges(min.coords, max.coords),
+                    TxID = genes$tx_id)
 }
 
 ### Loop through peak files
