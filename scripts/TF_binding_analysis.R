@@ -1,6 +1,7 @@
 library('ChIPseeker') # also imports plyr, magrittr, GenomicRanges, TxDb.Hsapiens.UCSC.hg19.knownGene
 library('tools')
 library('biomaRt')
+library('TxDb.Hsapiens.UCSC.hg19.knownGene')
 
 ### Function Declarations
 
@@ -51,9 +52,9 @@ seqlevels(tf.peaks) <- paste0('chr', seqlevels(tf.peaks))
 
 # Make global Biomart
 if (!exists('ensembl')) {
-  ensembl <- useMart(mart = "ENSEMBL_MART_ENSEMBL",
+  ensembl <- useMart("ENSEMBL_MART_ENSEMBL",
                      dataset = "hsapiens_gene_ensembl",
-                     host = "www.ensembl.org")
+                     host = "grch37.ensembl.org")
 }
 
 entrezToENSG <- function(entrez.gene.list) {
@@ -69,24 +70,31 @@ if (!exists('txdb_hg19')) {
   genedf <- as.data.frame(transcripts(txdb_hg19))
   colnames(genedf)[1:3] <- c("chrom","txStart","txEnd")
   genedf$geneID <- select(TxDb.Hsapiens.UCSC.hg19.knownGene, as.character(genedf$tx_id), "GENEID", keytype = "TXID")[['GENEID']]
-  
-  id.vals <- genedf$tx_name[is.na(genedf$geneID)]
-  entrezless.ensg.fetch <- getBM(attributes = c("ucsc","ensembl_gene_id"),
-                                 filters = 'ucsc',
-                                 mart = ensembl,
-                                 values = id.vals)
-  still.unknown.ucsc <- setdiff(id.vals, entrezless.ensg.fetch$ucsc)
+  ucsc.no.entrez <- genedf$tx_name[is.na(genedf$geneID)]
+  # mapping to ENSG drops duplicate ENSTs, i.e. fewer UCSC IDs get mapped -_- ...so just map to ENST first
+  no.entrez.to.ensg.bm <- getBM(attributes = c("ucsc","ensembl_gene_id"),
+                                filters = 'ucsc',
+                                mart = ensembl,
+                                values = ucsc.no.entrez)
+  still.unknown.ucsc <- setdiff(ucsc.no.entrez, no.entrez.to.ensg.bm$ucsc)
   # First get all the gene-less UCSC ID's but not found in Biomart from UCSC ID,
   # failing that get ENST IDs from the UCSC hg19.knownGenes-linked knownToEnsembl table (downloaded from table browser)
   ucsc.ensembl.table <- read.table('~/Downloads/hg19_missing_known_genes_enst.txt',
                                    sep='\t', header = TRUE, na.strings = 'n/a',
                                    stringsAsFactors = FALSE)[,c(1,4)]
-  ucsc.enst.vals <- ucsc.ensembl.table[!is.na(ucsc.ensembl.table$hg19.knownToEnsembl.value),]
-  still.unknown.table <- ucsc.ensembl.table[ucsc.ensembl.table$hg19.knownGene.name %in% still.unknown.ucsc,]
+  colnames(ucsc.ensembl.table) <- c('ucsc','enst')
+  ucsc.enst.pairs <- ucsc.ensembl.table[!is.na(ucsc.ensembl.table$enst),]
+  # known.enst.test <- c(1,2,3,4,5)
+  # enst.test.df <- as.data.frame(list(c('1','2','3','4','5'), c("hello","world","etc","more","things")))
+  # colnames(enst.test.df) <- c("ucsc","ensg")
+  # still.unknown.test <- c('3','4')
+  ucsc.identified.pairs <- ucsc.enst.pairs[ucsc.enst.pairs$ucsc %in% still.unknown.ucsc,]
+  unidentified.ucsc <- setdiff(still.unknown.ucsc, ucsc.enst.pairs$ucsc)
+  ucsc.enst.pairs[! ucsc.enst.pairs$ucsc %in% still.unknown.ucsc,]
   # nrow(still.unknown.table) = 8550
   # then get union of rows with still.unknown.ucscs in the ucsc.enst.vals
   known.enst.table <- still.unknown.table[still.unknown.table$hg19.knownGene.name %in% ucsc.enst.vals$hg19.knownGene.name,]
-  # multiple duplicated ENST transcripts (280 of 2643)
+  # 280 duplicated ENST transcripts of 2643 UCSC IDs now mapped
   # 8550 - 2643 = 5907 still unknown
   final.unknown.table still.unknown.table[known.enst.table$]
   
