@@ -11,7 +11,6 @@ library('stringr')
 library('biomaRt')
 library('data.table')
 library('tidyr')
-library('VennDiagram')
 
 ### Source files
 if (!exists('assembly.report')) {
