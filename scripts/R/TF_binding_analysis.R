@@ -1,17 +1,19 @@
 library('magrittr')
 library('ChIPseeker') # also imports plyr, GenomicRanges
 library('tools')
+library('plyr')
+library('ggplot2')
+library('RColorBrewer')
 library('dplyr')
+library('reshape2')
 library('seqinr')
 library('stringr')
 library('biomaRt')
 library('data.table')
 library('tidyr')
+library('VennDiagram')
 
 ### Source files
-if (!exists('genome.cdna')) { 
-  genome.cdna <- read.fasta('../../hg19/ensembl/Homo_sapiens.GRCh37.74.cdna.all.fa')
-}
 if (!exists('assembly.report')) {
   assembly.of.interest <- 'GRCh37.p13' # matches assembly version of Ensembl genome database
   assembly.version.map <- read.table('/gits/grc-issues/assembly_reports/assembly_version_table.tsv',
@@ -55,12 +57,13 @@ if (!exists('grc.locations')) {
                               sep = '\t', stringsAsFactors = FALSE, header = TRUE)
 }
 if (!exists('tf.peaks')) {
-  # Use the reference list of peaks Yaoyong provided:
+  # Use the reference list of peaks provided:
   tf.peakfile <- '../../peaks/H1_FOXK2_strongest_peaks.narrowPeak'
   tf.peaks <- readPeakFile(file.path(tf.peakfile))
   seqlevels(tf.peaks) <- paste0('chr', seqlevels(tf.peaks))
+  qc.tf.peaks <- tf.peaks * -0.4 # scale to 40% width, as in Davie 2015 (10.1371/journal.pgen.1004994)
 }
-if (!exists('genome.contigs') { 
+if (!exists('genome.contigs')) { 
   genome.contigs <- c(1:22, "X", "Y", "MT") # aim to determine which of these contig is in
 }
 
@@ -69,17 +72,23 @@ if (!exists('genome.contigs') {
 # iterate over guts of analysis in this function when finished drafting
 AtacOverlap <- function(peak_name) {
   atac.peaks <<- get(peak_name)
-  qc.atac.peaks <<- atac.peaks * -0.4 # scale to 40% width
   
   # Number of hits, including duplicated TF peaks (1-to-many TFBS-to-ATAC peak mapping)
   
   # length(which(duplicated(ranges(ref.peaks[subjectHits(findOverlaps(atac.peaks, ref.peaks))]))))
   
-  qc.tfbs.at.atac <<- subsetByOverlaps(tf.peaks, qc.atac.peaks)
+  qc.tfbs.at.atac <<- subsetByOverlaps(qc.tf.peaks, atac.peaks)
   n.untrimmed.overlaps <<- length(findOverlaps(tf.peaks, atac.peaks))
   n.unique.untrimmed.overlaps <<- length(subsetByOverlaps(tf.peaks, atac.peaks))
-  n.qc.overlaps <<- length(findOverlaps(tf.peaks, qc.atac.peaks))
+  n.qc.overlaps <<- length(findOverlaps(qc.tf.peaks, atac.peaks))
   n.unique.qc.overlaps <<- length(qc.tfbs.at.atac)
+  
+  qc.tfbs.stats <<- rbind(qc.tfbs.stats,
+    data.frame(uq.qc.over = n.unique.qc.overlaps,
+       qc.over = n.qc.overlaps,
+       uq.over = n.unique.untrimmed.overlaps,
+       over = n.untrimmed.overlaps,
+       stringsAsFactors = FALSE))
   
   paste0(peak_name %>%
            gsub(".peaks", "", .),
@@ -95,13 +104,75 @@ AtacOverlap <- function(peak_name) {
          round ( 100 * ( n.unique.untrimmed.overlaps / n.untrimmed.overlaps ), digits = 1 ),
          "% unique of ",
          n.untrimmed.overlaps,
-         ") without QC trimming.") %>%
-    print()
+         ") without QC trimming.\n") %>%
+    cat()
+  
+  sample.name <- peak_name %>% gsub(".peaks", "", .)
+  
+  sample.atac.lists[[sample.name]] <<- list(atac.peaks %>% ranges)
+  
+  mapSitesToTSS(sample.name)
 }
-mapSitesToTSS <- function() {
-  tfbs.at.tss <- subsetByOverlaps(tss.us, qc.tfbs.at.atac)
-  qc.tfbs.at.atac[qc.tfbs.at.atac %over% tss.us]
+
+mapSitesToTSS <- function(sample.name) {
+  seqlevels(qc.tfbs.at.atac) <- seqlevels(qc.tfbs.at.atac) %>% str_split(pattern = 'chr') %>% vpluck(2)
+  
+  tss.with.tfbs <- subsetByOverlaps(tss.us.ranges, qc.tfbs.at.atac)
+  # this object is useless in terms of biological meaning, the range needs to be reverted to a TSS coordinate
+  
+  tfbs.at.tss <- subsetByOverlaps(qc.tfbs.at.atac, tss.us.ranges)
+  # can match these (3010) back to the TSS if you keep this object along with the mapping (Hits) object
+  
+  peak.tss.mapping <- findOverlaps(qc.tfbs.at.atac, tss.us.ranges)
+  tss.sites <- tss.us.ranges
+  ranges(tss.sites) <- ( ifelse(strand(tss.sites) == '+', start(tss.sites), end(tss.sites)) %>% IRanges(start = ., end = .) )
+  
+    #   system.time(( if(strand(tss.sites) == '+') {
+    #     min(ranges(tss.sites)) %>% IRanges(start = ., end = .) 
+    #   }
+    #   else {
+    #     max(ranges(tss.sites)) %>% IRanges(start = ., end = .)
+    #   }))
+  
+  #  peak.tss.mapping %>% queryHits %>% unique %>% length
+  #  [1] 3010
+  #  matches the number of tfbs.at.tss
+  
+  #  > peak.tss.mapping %>% subjectHits %>% unique %>% length
+  #  [1] 19095
+  
+  #   tss.sites[peak.tss.mapping %>% queryHits %>% unique]$genebiotype %>% sort %>% table
+  #   
+  #   IG_C_gene        IG_D_gene        IG_J_gene       IG_V_gene polymorphic_pseudogene   protein_coding    TR_C_gene     TR_D_gene 
+  #   24               53               20              153       172                      2383              6             3 
+  #   TR_J_gene        TR_V_gene 
+  #   68               128
+  
+  peak.tss.mapping <- findOverlaps(qc.tfbs.at.atac, tss.us.ranges)
+  pc.peak.tss.map <- peak.tss.mapping[ (tss.us.ranges[peak.tss.mapping %>% subjectHits]$genebiotype == 'protein_coding') ]
+  cat(paste0("Only using protein coding genes: discarding ", (peak.tss.mapping %>% length) - (pc.peak.tss.map %>% length), ' of ', peak.tss.mapping %>% length,
+      ' (', ((1 - ( (pc.peak.tss.map %>% length) / (peak.tss.mapping %>% length))) * 100) %>% round(digits = 2), '%)'))
+  
+  distance.table <- tss.sites[pc.peak.tss.map %>% subjectHits]
+  distance.table$peak_index <- Rle(pc.peak.tss.map %>% queryHits)
+  distance.table$peak_range <- IRanges(qc.tfbs.at.atac[pc.peak.tss.map %>% queryHits] %>% ranges)
+  distance.table$distance <- distance(distance.table %>% ranges, distance.table$peak_range)
+  
+  melted.gene.distances <- melt(as.data.frame(distance.table)[,c('seqnames','gene','distance')], id.vars = c('seqnames',"gene","distance"))
+  grouped.gene.distances <- group_by(melted.gene.distances, gene)
+  # get the minimum distance for each gene and store it as an Rle back in the distance table
+  min.distances <- summarise(grouped.gene.distances, min=min(distance)) %>%
+    slice(match(unique(distance.table$gene), gene))
+  
+  distance.table$min_dist <- join(distance.table[,'gene'] %>% as.data.frame, min.distances, by = 'gene')$min
+  
+  min.distance.table <- distance.table[distance.table$distance == distance.table$min_dist][,c('gene','min_dist')]
+  gene.min.distance.table <- min.distance.table[!duplicated(min.distance.table$gene),]
+  
+  print(paste0(sample.name," has ",gene.min.distance.table$gene %>% length," ENSG-identified genes with a peak within 1kb u/s"))
+  sample.gene.lists[[sample.name]] <<- list(gene.min.distance.table$gene)
 }
+
 vpluck <- function(x, i) vapply(x, "[[", i, FUN.VALUE = x[[1]][[i]])
 ContigToGenBank <- function(contig.name, accession.map = contigs.to.genbank) {
   accession.map[which(accession.map[,1] == contig.name),2]
@@ -233,10 +304,14 @@ ParseTranscript <- function(transcript) {
 ParseTranscriptSet <- function(transcripts) {
   transcript.counter <<- 1
   transcripts.vlen <<- length(transcripts)
-  lapply(transcripts, ParseTranscript) %>%
+  parsed.transcripts <- lapply(transcripts, ParseTranscript) %>%
     unname %>%
     rbindlist %>%
     as.data.frame
+  # only use the rows on which contig !is.na
+  # (the unlocalised/unplaced ones in GL000 ranges, deliberately returned as such)
+  # those are also the only rows on which location is 'supercontig' rather than 'chromosome'
+  return( parsed.transcripts[!parsed.transcripts$contig %>% is.na, ] )
 }
 
 if (!exists('contig.map')) {
@@ -247,21 +322,22 @@ if (!exists('contig.map')) {
   contig.map$genbank <- contig.map$contig %>% lapply(ContigToGenBank) %>% unlist
 }
 
-if (!exists('transcriptdf')) {
-  transcriptdf <- InitialParseTranscriptSet(genome.cdna[1:1000])
-}
-
-InitialParseTranscriptSet <- function(input.transcripts) {
-  data.frame(transcripts = names(input.transcripts),
-             contig = input.transcripts %>% getAnnot %>% str_split(":") %>% vpluck(4),
-  )
-  ContigToGenBank(x)
-}
-
 # Set up a reference to the transcripts in the hg19 reference genome (for TSS coordinates)
 if (!exists('genedf')) {
-  genedf <- ParseTranscriptSet(genome.cdna)
-  # NB only use the rows on which contig !is.na (the unlocalised/unplaced ones in GL000 ranges, deliberately returned as such)
+  
+  ## COMMENT OUT THIS BLOCK TO OVERWRITE THE READ GENEDF FROM FILE
+  
+  if (file.exists('genedf_5kb.rds')) {
+    genedf <- readRDS('genedf_5kb.rds')
+#   if (file.exists('genedf_1kb.rds')) {
+#     genedf <- readRDS('genedf_1kb.rds')
+  } else {
+  
+  ## COMMENT OUT THIS BLOCK TO OVERWRITE THE READ GENEDF FROM FILE
+    
+    if (!exists('genome.cdna')) genome.cdna <- read.fasta('../../hg19/ensembl/Homo_sapiens.GRCh37.74.cdna.all.fa')
+    genedf <- ParseTranscriptSet(genome.cdna)
+   }
   is.p.str <- genedf$strand == '+'
   ascending.coords <- transform(genedf[c("tx.start","tx.kb.us")],
                                 range.min = ifelse(is.p.str, tx.kb.us, tx.start),
@@ -276,95 +352,222 @@ if (!exists('genedf')) {
                            genebiotype = genedf$gene.biotype,
                            txbiotype = genedf$transcript.biotype)
   
-  unmapped.chr.transcripts <- genedf[genedf$contig %>% is.na,]
-  unmapped.chr.transcripts$contig.name <- genedf[genedf$contig %>% is.na,] %>% extract2('transcript') %>%
-    lapply(function(x){
-      genome.cdna %>% extract2(x) %>% getAnnot %>% str_split(':') %>% vpluck(4)
-    }) %>% unlist
-  # unmapped.chr.transcripts$contig.name %>% lapply(function(x){(grc.issues$genbank == x) %>% any}) %>% unlist %>% any
-  # ==> FALSE
-  unmapped.chr.table <- unmapped.chr.transcripts$contig.name %>%
-    lapply(function(x){
-      grc.locations[which(grc.locations$MappedSeqInfo.GenBankID == x),]
-    }) %>%
-    do.call(what="rbind", args=.)
-  # unmapped.chr.table %>% extract2('id') %>% sort %>% unique %>% length
-  # ==> 20 unique unmappable IDs
-  # unmapped.chr.table %>% extract2('id') %>% sort %>% unique
-  # ==> "HG-1013" "HG-1100" "HG-1103" "HG-1104" "HG-1284" "HG-1285" "HG-1659" "HG-1662" "HG-1737" "HG-1803" "HG-1804" "HG-1847" "HG-1959" "HG-2011" "HG-255"  "HG-630"  "HG-660" 
-  #     "HG-661"  "HG-789"  "HG-791" 
-  
-  # It's possible there were flaws in the way I handled chromosome assignment for the ones mapped through 'backup' function PatchIdToChr
-  # which figuring out the representation of the correct contig placement per assembly (i.e. of issue encoding) may clarify, i.e. these
-  # edge cases may improve the whole set, so worth doing rather than just throwing them away...
-  
-  # i.e. the method above may simply discard the Un option for pairs (e.g. "chr4 or chrUn"), when it may be the case GRCh37.p13 had removed the chromosome 4 mapping.
-  # Clarifying the specification format per assembly version would verify it (some "chr4" cases in the above example may become "chrUn"), and avoid this problem.
-  
-  # Alternatively, it's possibly not decipherable directly from the given tables, i.e. if the issues do not record this systematically,
-  # in which case confirming the 9 GenBank IDs by hand would be fine... but then not possible to do for other releases...
-  
-  # unmapped.chr.table$MappedSeqInfo.GenBankID %>% sort %>% unique
-  # ==> "GL000193.1" "GL000194.1" "GL000213.1" "GL000215.1" "GL000218.1" "GL000219.1" "GL000221.1" "GL000222.1" "GL000223.1"
-  
-  # To compare the location data associated with a single GenBank accession [per transcript at issue]
-  # echo "$(head -1 human_locations.tsv; grep 'GL000194.1' human_locations.tsv)" | cutf 1,2,3,4,6,7,8,13,16 | tsvview
-  
-  # For all unmapped GenBank IDs (9):
-  # ids=("GL000193.1" "GL000194.1" "GL000213.1" "GL000215.1" "GL000218.1" "GL000219.1" "GL000221.1" "GL000222.1" "GL000223.1")
-  # echo "$(head -1 human_locations.tsv; for gbid in ${ids[*]}; do grep $gbid human_locations.tsv; done | sort -k4,4 -k1,1)" | cutf 1,2,3,4,6,7,8,13,16 | tsvview
-  
-  # For all unmapped patches (20):
-  # patchids=("HG-1013" "HG-1100" "HG-1103" "HG-1104" "HG-1284" "HG-1285" "HG-1659" "HG-1662" "HG-1737" "HG-1803" \
-  #           "HG-1804" "HG-1847" "HG-1959" "HG-2011" "HG-255"  "HG-630"  "HG-660"  "HG-661"  "HG-789"  "HG-791")
-  # ...View issue's longform locations:
-  # echo "$(head -1 human_locations.tsv; for patchid in ${ids[*]}; do grep $patchid human_locations.tsv; done | sort -k4,4 -k1,1)" | cutf 1,2,3,4,6,7,8,13,16 | tsvview
-  # ...View issue with shortform locations:
-  # echo "$(head -1 human.tsv; for patchid in ${ids[*]}; do grep $patchid human.tsv; done)" | tsvview
-  
-  # For all locations:
-  # echo "$(head -1 human_locations.tsv; tail --lines=+2 human_locations.tsv | sort -k4,4 -k1,1)" | cutf 1,2,3,4,6,7,8,13,16 | tsvview
-  
-  # Looking at multi-chromosome mapping IDs
-  # manually get contig.map$genbank (no unplaced/unloc. contigs) onto clipboard, removing double quotes and iterating through bash string array:
-  # gbids=`xclip -o`
-  # for gbid in ${gbids[*]}; do echo "$(head -1 human_locations.tsv; grep "$gbid" human_locations.tsv)"  | tsvview; done
-  
-  # got a list from MANUAL INSPECTION(...) of list... for those with more than one chromosome
-  
-  # bad_patch_ids=(JH720453.7 JH636052.4 JH636053.3 KE332496.1 GL383561.2 KE332502.1)
-  # for gbid in ${bad_patch_ids[*]}; do echo "$(head -1 human_locations.tsv; grep "$gbid" human_locations.tsv)"  | tsvview; done
-  
-  # in R:
-  # grc.issues[which(grc.issues$genbank %in% c('JH720453.7', 'JH636052.4', 'JH636053.3', 'KE332496.1', 'GL383561.2', 'KE332502.1')),]
-  # grc.locations[which(grc.locations$MappedSeqInfo.GenBankID %in% c('JH720453.7', 'JH636052.4', 'JH636053.3', 'KE332496.1', 'GL383561.2', 'KE332502.1')),]
-  
-  # properly in R, for each group of genedf transcript rows made by matching against GenBank ID:
-  # list.of.bad.patch.transcript.locations <- lapply(contig.map$genbank, function(x) {
-  #   patch.locations <- grc.locations[which(grc.locations$MappedSeqInfo.GenBankID == x),]
-  #   if ((grc.locations$chr %>% sort %>% unique %>% length) > 1) {
-  #     return(patch.locations)
-  #   }
-  # })
-  # list.of.bad.patch.transcript.locations <- list.of.bad.patch.transcript.locations[lapply(list.of.bad.patch.transcript.locations, function(x){!is.null(x)}) %>% unlist]
-  # list.of.bad.patch.transcript.locations[1]
-  # ==> [[1]]
-  #           id chr SuccessfullyMapped MappedSeqInfo.GenBankID MappedSeqInfo.RefSeqID MappedSeqInfo.SequenceType ChrStart  ChrEnd MappedVersionNumbers MappedVersionAccessions
-  # 3645  HG-581   1             MAPPED              JH720453.1         NW_003871100.1               ALT_SCAFFOLD  1350798 1378514                  2,2       BX682528,BX682528
-  # 6802 HG-1425   X             MAPPED              JH720453.1         NW_003871100.1               ALT_SCAFFOLD        1 1452651                  2,3       AC233982,CR407552
-  #      Accession1Method Accession2Method AssemblyName GenBankAssemblyAcc RefSeqAssemblyAcc AssemblyStatus
-  # 3645        alignment        alignment   GRCh37.p13   GCA_000001405.14  GCF_000001405.25            old
-  # 6802        component        alignment   GRCh37.p13   GCA_000001405.14  GCF_000001405.25            old
+  saveRDS(genedf, 'genedf.rds') # save having to regenerate from source each time you reload project
 }
 
 ### Get stats against ATAC seq experimental/control samples
+
+sample.gene.lists <- list() # sample-to-gene list mapping
+sample.atac.lists <- list() # sample-to-ATAC-open-region-count list mapping
+qc.tfbs.stats <- data.frame() # sample-to-QC-trimming-count-statistics mapping
 
 for (peakfile in list.files(peak_filepath <- '../../peaks/atac', '*.narrowPeak')) {
   peak_name <- file_path_sans_ext(peakfile) %>%
     gsub("_peaks", ".peaks", .)
   if (!exists(peak_name)) assign(peak_name, readPeakFile(file.path(peak_filepath, peakfile)))
   AtacOverlap(peak_name)
-  mapSitesToTSS()
   rm(list = as.character(peak_name)) # avoid large files building up in the workspace
 }
 gc() # force garbage collection to ensure no system crashes
+
+# OPTIONAL MEMORY SAVING RM STATEMENT
+
+# rm('ascending.coords', 'assembly.report.table', 'assembly.version.map',
+#    'genedf', 'atac.peaks', 'tss.us.ranges', 'tf.peaks', 'qc.tf.peaks')
+
+paste0("Mean values were: ",
+       round(qc.tfbs.stats$uq.qc.over %>% mean),
+       " (",
+       round ( 100 * ( (qc.tfbs.stats$uq.qc.over / qc.tfbs.stats$qc.over) %>% mean ), digits = 1 ),
+       "% unique of ",
+       round(qc.tfbs.stats$qc.over %>% mean),
+       " QC-trimmed) TFBS in ATAC-defined 'accessible regions', or ",
+       round(qc.tfbs.stats$uq.over %>% mean),
+       " (",
+       round ( 100 * ( (qc.tfbs.stats$uq.over / qc.tfbs.stats$over) %>% mean) , digits = 1 ),
+       "% unique of ",
+       round(qc.tfbs.stats$over %>% mean),
+       ") without QC trimming.\n") %>%
+  cat()
+
+gc.length.list <- list()
+for (list.item in names(sample.gene.lists)) {
+  gc.length.list[[list.item]] <- length(unlist(sample.gene.lists[[list.item]]))
+}
+
+atac.length.list <- list()
+for (list.item in names(sample.atac.lists)) {
+  atac.length.list[[list.item]] <- unlist(sample.atac.lists[[list.item]])[[1]] %>% length
+}
+
+std.error <- function(x) sd(x)/sqrt(length(x))
+
+atac.width.list <- list()
+atac.se.list <- list()
+for (list.item in names(sample.atac.lists)) {
+  atac.width.list[[list.item]] <- unlist(sample.atac.lists[[list.item]])[[1]] %>% width %>% mean
+  atac.se.list[[list.item]] <- unlist(sample.atac.lists[[list.item]])[[1]] %>% width %>% std.error
+}
+
+sample.names <- names(gc.length.list %>% unlist)
+sample.names[1:9] <- c('1 (T)', '2 (N)', '3 (T)', '4 (N)',
+                       '5 (T)', '6 (N)', '7 (T)', '8 (T)', '9 (T)')
+
+sample.gene.list.length.df <- data.frame(sample = sample.names,
+                                         gene.count = gc.length.list %>% unlist,
+                                         group = sample.names %>%
+                                           gsub(pattern = '_.*', '', x = .) %>%
+                                           factor,
+                                         row.names = NULL,
+                                         stringsAsFactors = FALSE)
+
+sample.atac.list.length.df <- data.frame(sample = sample.names,
+                                         atac.count = atac.length.list %>% unlist,
+                                         atac.width = atac.width.list %>% unlist,
+                                         atac.width.se = atac.se.list %>% unlist,
+                                         group = sample.names %>%
+                                           gsub(pattern = '_.*', '', x = .) %>%
+                                           factor,
+                                         row.names = NULL,
+                                         stringsAsFactors = FALSE)
+
+sample.types <- data.frame(group = sample.gene.list.length.df$group %>% levels,
+                           type = c('t','n','t','n','t','n',rep('t',3),rep('n',2),rep('t',3) ) )
+
+sample.gene.list.length.df <- join(sample.gene.list.length.df, sample.types, by='group')
+sample.atac.list.length.df <- join(sample.atac.list.length.df, sample.types, by='group')
+
+# sample.gene.list.length.df <- data.frame(gene.count = gc.length.list %>% unlist %>% sort,
+#                                          stringsAsFactors = FALSE)
+
+# colourCount <- sample.gene.list.length.df$sample.group %>% levels %>% length
+# getPalette = colorRampPalette(brewer.pal(9, cbPalette))
+modAccentPalette <- c("#7FC97F", "#BEAED4", "#FDC086", "#FFFF99",
+                      "#386CB0", "#dd3c3c", "#5af2a3", "#666666")
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73",
+               "#F0E442", "#b87ab8", "#D55E00", "#CC79A7")
+getPalette <- c(modAccentPalette, cbPalette)
+
+# Possible figure: A bar plot of the samples grouped by cell type
+#   - no real differences shown between samples (though OE33_R3 looks out?)
+#   - no real difference observable between tumour and normal (could be quantified/tested?)
+
+plot.theme <- theme_bw() + theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+sample_gene_count_bar <- ggplot(sample.gene.list.length.df,
+                                aes(x=sample,
+                                    y=gene.count,
+                                    fill=group)) + 
+              geom_bar(stat="identity") +
+              labs(fill='Cell line \n(if specified)\n\nT = tumour,\nN = normal\n',
+                   x='Sample', y='Gene count') +
+              scale_fill_manual(values = getPalette) + plot.theme +
+              expand_limits(y=0) + scale_y_continuous(expand = c(0, 0))
+
+# Change colour scheme for second version, comparing tumour vs. normal samples
+sample_type_gene_count_bar <- ggplot(sample.gene.list.length.df,
+                                     aes(x=sample,
+                                         y=gene.count,
+                                         fill=factor(type, labels=c('Normal','Tumour')))) +
+                              geom_bar(stat="identity") +
+                              labs(fill='Sample type',
+                                   x='Sample', y='Gene count') + plot.theme +
+                              expand_limits(y=0) + scale_y_continuous(expand = c(0, 0)) +
+                              scale_fill_manual(values = brewer.pal(3, 'Set2'))
+
+# TASK: Test whether numbers of genes between tumour and normal differ:
+melt(sample.gene.list.length.df) %>%
+  group_by(type) %>%
+  summarise(n=length(value), mean=mean(value), sd(value))
+# Using sample, group, type as id variables
+# Source: local data frame [2 x 4]
+# 
+#   type       n        mean       sd(value)
+#  (fctr)    (int)      (dbl)       (dbl)
+#    n         7      8169.571     1332.282
+#    t        10      7973.800     1824.760
+t.test(sample.gene.list.length.df$gene.count~sample.gene.list.length.df$type)
+# data:  sample.gene.list.length.df$gene.count by sample.gene.list.length.df$type
+# t = 0.25562, df = 14.935, p-value = 0.8017
+# alternative hypothesis: true difference in means is not equal to 0
+# 95 percent confidence interval:
+#   -1437.241  1828.784
+# sample estimates:
+#   mean in group n mean in group t 
+# 8169.571        7973.800 
+# 
+# > t.test(sample.gene.list.length.df$gene.count~sample.gene.list.length.df$type)$p.value
+# [1] 0.8017292
+
+#TASK: test commonality of regulated genes between/within cancer and regular samples
+all.in.all.cancer.genes <- sample.gene.lists[(sample.gene.list.length.df$type == 't') %>% which] %>% 
+  unlist %>% unique
+oes.cancer.genes <- sample.gene.lists[(sample.gene.list.length.df$group %in% c('OE19','OE33')) %>% which] %>%
+  unlist %>% unique
+all.in.all.normal.genes <- sample.gene.lists[(sample.gene.list.length.df$type == 'n') %>% which] %>% 
+  unlist %>% unique
+common.genes <- (all.in.all.cancer.genes)[(all.in.all.cancer.genes) %in% (all.in.all.normal.genes) %>% which]
+common.oes.cancer.genes <- (oes.cancer.genes)[(oes.cancer.genes) %in% (all.in.all.cancer.genes) %>% which]
+pc.unique.cancer <- (1 - ( common.genes %>% length / all.in.all.cancer.genes %>% length) ) * 100
+pc.unique.oes <- (1 - ( common.oes.cancer.genes %>% length / all.in.all.cancer.genes %>% length) ) * 100
+pc.unique.normal <- (1 - ( common.genes %>% length / all.in.all.normal.genes %>% length) ) * 100
+cat(paste0('Percent of genes unique to cancer samples: ', pc.unique.cancer %>% round(digits = 1), '% (', 
+             (all.in.all.cancer.genes %>% length) - (common.genes %>% length), ' of ', (all.in.all.cancer.genes %>% length), ')\n',
+             'Percent of genes unique to normal samples: ', pc.unique.normal %>% round(digits = 1), '% (', 
+             (all.in.all.normal.genes %>% length) - (common.genes %>% length), ' of ', (all.in.all.normal.genes %>% length), ')'))
+
+# With 40% ATAC peak width QC trimming at 5kb upstream range:
+# Percent of genes unique to cancer samples: 5.6% (594 of 10585)
+# Percent of genes unique to normal samples: 3.2% (333 of 10324)
+
+# With 40% ATAC peak width QC trimming at 1kb upstream range:
+# Percent of genes unique to cancer samples: 3.7% (380 of 10331)
+# Percent of genes unique to normal samples: 2.4% (247 of 10198)
+
+sample_open_region_count_bar_by_type <- ggplot(sample.atac.list.length.df,
+                                     aes(x=sample,
+                                         y=atac.count,
+                                         fill=factor(type, labels=c('Normal','Tumour')))) +
+  geom_bar(stat="identity") +
+  labs(fill='Sample type',
+       x='Sample', y='ATAC accessible chromatin regions count') + plot.theme +
+  expand_limits(y=0) + scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = brewer.pal(3, 'Set2'))
+
+# TASK: Test whether numbers of ATAC open regions between tumour and normal differ:
+melt(sample.atac.list.length.df) %>%
+  group_by(type) %>%
+  summarise(n=length(value), mean=mean(value), sd(value))
+# Using sample, group, type as id variables
+# Source: local data frame [2 x 4]
+# 
+# type     n     mean sd(value)
+# (fctr) (int)    (dbl)     (dbl)
+# 1      n     7 57232.57  42682.45
+# 2      t    10 57640.50  40659.57
+t.test(sample.atac.list.length.df[10:17,]$atac.count~sample.atac.list.length.df[10:17,]$type)
+# Welch Two Sample t-test
+# 
+# data:  sample.atac.list.length.df$atac.count by sample.atac.list.length.df$type
+# t = -0.019774, df = 12.643, p-value = 0.9845
+# alternative hypothesis: true difference in means is not equal to 0
+# 95 percent confidence interval:
+#   -45103.60  44287.74
+# sample estimates:
+#   mean in group n mean in group t 
+# 57232.57        57640.50 
+
+#TASK: above but with ATAC peak widths
+sample_open_region_width_bar_by_type <- ggplot(sample.atac.list.length.df,
+                                               aes(x=sample,
+                                                   y=atac.width,
+                                                   fill=factor(type, labels=c('Normal','Tumour')))) +
+  geom_bar(stat="identity") +
+  geom_errorbar(stat="identity", aes(ymin=atac.width-atac.width.se,
+                                     ymax=atac.width+atac.width.se,
+                                     width=.3,)) +
+  labs(fill='Sample type',
+       x='Sample', y='ATAC accessible chromatin regions, mean width') + plot.theme +
+  expand_limits(y=0) + scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = brewer.pal(3, 'Set2'))
